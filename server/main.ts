@@ -72,13 +72,41 @@ setInterval(() => {
   for (const [k, b] of BUCKETS) if (b.ts < cutoff) BUCKETS.delete(k);
 }, 60_000);
 
+// ── Live viewer counter ───────────────────────────────────────────────────
+// Polling-based: clients ping /viewers every 15s with a stable session id;
+// server keeps a map of {sid -> last_seen}, reaps anything older than 30s.
+const VIEWERS = new Map<string, number>();
+const VIEWER_TTL = 30;  // seconds
+function viewerCount(excludeSid: string): number {
+  const now = Date.now() / 1000;
+  let n = 0;
+  for (const [sid, ts] of VIEWERS) {
+    if (now - ts > VIEWER_TTL) VIEWERS.delete(sid);
+    else if (sid !== excludeSid) n++;
+  }
+  return n;
+}
+
 const app = new Hono();
 
 app.use("*", async (c, next) => {
+  // /viewers is a fast in-memory poll; skip rate limit so a busy room doesn't
+  // trip it (every viewer hits this every 15s by design).
+  const path = new URL(c.req.url).pathname;
+  if (path === "/viewers") { await next(); return; }
   if (!rateLimit(clientIp(c.req.raw))) {
     return new Response("rate limited", { status: 429, headers: { "Retry-After": "30" } });
   }
   await next();
+});
+
+app.get("/viewers", c => {
+  const sid = c.req.query("sid") || "";
+  const now = Date.now() / 1000;
+  if (sid) VIEWERS.set(sid, now);
+  const others = viewerCount(sid);
+  c.header("Cache-Control", "no-store");
+  return c.json({ others, total: VIEWERS.size });
 });
 
 app.get("/now", c => {
@@ -114,10 +142,19 @@ app.get("/", c => c.html(`<!doctype html>
   #idle{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000;z-index:20;color:var(--muted);font-size:11px;letter-spacing:0.18em;text-transform:uppercase}
   #idle.gone{opacity:0;pointer-events:none;transition:opacity 600ms}
   #idle b{color:var(--pink);font-size:46px;display:block;margin-bottom:14px;text-shadow:0 0 24px rgba(230,0,103,0.5)}
+  .viewers{position:fixed;top:16px;left:18px;z-index:11;display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:0.1em;text-transform:uppercase;color:var(--teal);pointer-events:none;text-shadow:0 0 8px rgba(0,0,0,0.9),0 0 18px rgba(0,0,0,0.7);opacity:0;transition:opacity 600ms}
+  .viewers.on{opacity:0.95}
+  .viewers .dot{width:8px;height:8px;border-radius:50%;background:var(--pink);box-shadow:0 0 12px var(--pink),0 0 4px var(--pink);animation:viewerPulse 1.6s ease-in-out infinite}
+  .viewers .num{color:#fff;font-weight:600;letter-spacing:0.06em;transition:transform 220ms,color 220ms}
+  .viewers .num.bump{transform:scale(1.4);color:var(--pink)}
+  .viewers.alone .dot{background:var(--muted);box-shadow:none;animation:none;opacity:0.5}
+  .viewers.alone{color:var(--muted)}
+  @keyframes viewerPulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.18);opacity:0.55}}
 </style>
 </head><body>
 <div id="idle"><div style="text-align:center"><b>tv</b>tools.ejfox.com<br><span id="boot-line">tuning in…</span></div></div>
 <div id="player"></div>
+<div class="viewers" id="viewers"><span class="dot"></span><span><span class="num" id="viewer-num">—</span> <span id="viewer-label">tuning in</span></span></div>
 <div class="hud">
   <div>
     <div class="title">tv.tools.ejfox.com</div>
@@ -173,6 +210,34 @@ window.onYouTubeIframeAPIReady = async () => {
     }
   });
   setInterval(syncToNow, 60000);   // re-sync every minute against server clock
+
+  // ── live viewer counter ──
+  let SID = sessionStorage.getItem('tv_sid');
+  if (!SID) { SID = (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)); sessionStorage.setItem('tv_sid', SID); }
+  let lastCount = -1;
+  async function pingViewers() {
+    try {
+      const r = await fetch('/viewers?sid=' + encodeURIComponent(SID), { cache: 'no-store' });
+      const { others } = await r.json();
+      const el = document.getElementById('viewers');
+      const num = document.getElementById('viewer-num');
+      const lbl = document.getElementById('viewer-label');
+      el.classList.add('on');
+      if (others === 0) { el.classList.add('alone'); num.textContent = 'just'; lbl.textContent = 'you'; }
+      else {
+        el.classList.remove('alone');
+        num.textContent = others;
+        lbl.textContent = others === 1 ? 'other viewer' : 'other viewers';
+      }
+      if (others !== lastCount && lastCount >= 0) {
+        num.classList.add('bump');
+        setTimeout(() => num.classList.remove('bump'), 240);
+      }
+      lastCount = others;
+    } catch {}
+  }
+  pingViewers();
+  setInterval(pingViewers, 15000);
 };
 </script>
 </body></html>`));
