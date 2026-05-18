@@ -7,12 +7,29 @@ interface Video {
   duration: number | null;
   channel?: string;
   alive?: boolean;
+  sources?: unknown[];
+  dead_reason?: string;
 }
 
 const raw: Video[] = JSON.parse(await Deno.readTextFile("./playlist.json"));
 const PLAYLIST = raw.filter(v => v.alive !== false && typeof v.duration === "number" && v.duration > 0);
 const TOTAL = PLAYLIST.reduce((s, v) => s + (v.duration as number), 0);
 const EPOCH = Math.floor(Date.parse("2026-05-18T00:00:00Z") / 1000);
+
+// Trim the publicly-served playlist payload: keep only what a client actually
+// needs to render a station. Drops sources[], dead_reason, age_limit, etc.
+// Cache it pre-serialized + with an ETag so repeat hits cost ~zero.
+const PUBLIC_PLAYLIST = PLAYLIST.map(v => ({
+  id: v.id, title: v.title, duration: v.duration, channel: v.channel,
+}));
+const PUBLIC_PLAYLIST_JSON = JSON.stringify(PUBLIC_PLAYLIST);
+
+async function sha1(s: string): Promise<string> {
+  const buf = new TextEncoder().encode(s);
+  const hash = await crypto.subtle.digest("SHA-1", buf);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+const PUBLIC_PLAYLIST_ETAG = '"' + (await sha1(PUBLIC_PLAYLIST_JSON)) + '"';
 
 console.log(`tv.tools.ejfox.com — ${PLAYLIST.length} videos, ${(TOTAL/3600).toFixed(1)}h total, looping from epoch ${EPOCH}`);
 
@@ -28,14 +45,57 @@ function nowPlaying() {
   return { video: PLAYLIST[0], offset: 0, idx: 0 };
 }
 
+// ── Per-IP token bucket — defense against the obvious DoS surface ────────
+// 60 req/min sustained, burst of 30. In-memory; resets on app restart.
+const BUCKETS = new Map<string, { tokens: number; ts: number }>();
+const RATE = 60 / 60;   // tokens per second
+const BURST = 30;
+function rateLimit(ip: string): boolean {
+  const now = Date.now() / 1000;
+  const b = BUCKETS.get(ip);
+  if (!b) { BUCKETS.set(ip, { tokens: BURST - 1, ts: now }); return true; }
+  b.tokens = Math.min(BURST, b.tokens + (now - b.ts) * RATE);
+  b.ts = now;
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+function clientIp(req: Request): string {
+  return req.headers.get("cf-connecting-ip")
+      || req.headers.get("x-real-ip")
+      || (req.headers.get("x-forwarded-for") || "").split(",")[0].trim()
+      || "unknown";
+}
+// Reap idle buckets so memory is bounded.
+setInterval(() => {
+  const cutoff = Date.now() / 1000 - 600;
+  for (const [k, b] of BUCKETS) if (b.ts < cutoff) BUCKETS.delete(k);
+}, 60_000);
+
 const app = new Hono();
+
+app.use("*", async (c, next) => {
+  if (!rateLimit(clientIp(c.req.raw))) {
+    return new Response("rate limited", { status: 429, headers: { "Retry-After": "30" } });
+  }
+  await next();
+});
 
 app.get("/now", c => {
   const np = nowPlaying();
+  c.header("Cache-Control", "public, max-age=5");   // ≤5s playhead drift, big DoS win
   return c.json({ ...np, total: PLAYLIST.length, runtime_seconds: TOTAL });
 });
 
-app.get("/playlist.json", c => c.json(PLAYLIST));
+app.get("/playlist.json", c => {
+  if (c.req.header("if-none-match") === PUBLIC_PLAYLIST_ETAG) {
+    return new Response(null, { status: 304, headers: { ETag: PUBLIC_PLAYLIST_ETAG } });
+  }
+  c.header("Cache-Control", "public, max-age=300, stale-while-revalidate=600");
+  c.header("ETag", PUBLIC_PLAYLIST_ETAG);
+  c.header("Content-Type", "application/json; charset=utf-8");
+  return c.body(PUBLIC_PLAYLIST_JSON);
+});
 
 app.get("/", c => c.html(`<!doctype html>
 <html lang="en"><head>
