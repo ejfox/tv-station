@@ -1,0 +1,9 @@
+# local state — not for sharing
+sources/*.csv
+sources/*.html
+sources/*.txt
+playlist.json
+.env
+__pycache__/
+.venv/
+.DS_Store
