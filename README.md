@@ -171,6 +171,98 @@ app.get("/cooking", c => {
 
 ---
 
+## Watching it on an actual TV
+
+There's no real browser on Apple TV / Roku / Fire TV / Chromecast, so the cleanest "permanent channel on the wall" setup is **a cheap headless box → HDMI → TV, running Chromium in kiosk mode**. ~30 minutes once, then it's a dumb appliance.
+
+### Hardware
+
+Anything with HDMI out and Chromium/Chrome:
+- **Raspberry Pi 5** (~$80) — the canonical choice. Pi 4 works too, slightly less smooth.
+- **Mac mini** you already own — total overkill, but if it's sitting around, plug it in.
+- **A used Intel NUC** off eBay — silent, more headroom, $50-ish.
+
+### Pi (Raspberry Pi OS Lite + chromium-browser)
+
+Install Chromium, openbox, unclutter, and set autostart:
+
+```bash
+sudo apt update && sudo apt install -y \
+  --no-install-recommends \
+  xserver-xorg x11-xserver-utils xinit openbox chromium-browser unclutter
+```
+
+`~/.config/openbox/autostart`:
+
+```bash
+# disable screen blanking / DPMS
+xset s off
+xset -dpms
+xset s noblank
+
+# hide cursor after 0.1s idle
+unclutter -idle 0.1 -root &
+
+# launch the channel
+chromium-browser \
+  --kiosk \
+  --noerrdialogs \
+  --disable-infobars \
+  --disable-translate \
+  --check-for-update-interval=31536000 \
+  --autoplay-policy=no-user-gesture-required \
+  --app=https://tv.tools.ejfox.com
+```
+
+Start X on boot. In `~/.bash_profile`:
+
+```bash
+[[ -z $DISPLAY && $XDG_VTNR -eq 1 ]] && startx
+```
+
+Enable auto-login (`sudo raspi-config` → System Options → Boot/Auto Login → Console Autologin), reboot, you're live.
+
+**Audio out the HDMI**: `sudo raspi-config` → Advanced Options → Audio → HDMI. Verify with `speaker-test -c 2`.
+
+### Mac mini (macOS)
+
+LaunchAgent at `~/Library/LaunchAgents/com.user.tv-kiosk.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.user.tv-kiosk</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Applications/Google Chrome.app/Contents/MacOS/Google Chrome</string>
+    <string>--kiosk</string>
+    <string>--autoplay-policy=no-user-gesture-required</string>
+    <string>--app=https://tv.tools.ejfox.com</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+```
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.user.tv-kiosk.plist
+```
+
+Then **System Settings → Lock Screen → set everything to "Never"** so the mini doesn't snooze the TV.
+
+### Power button trick
+
+Wire a smart plug (Kasa, Hue, etc.) to the Pi/Mac. Now "turn on the TV channel" is a single button or voice command — the box boots, X comes up, kiosk launches, and within ~25 seconds you're back in the loop where everyone else is. The deterministic playhead means you don't miss a beat.
+
+### Apple TV fallback
+
+If you don't want a dedicated box, you can mirror from any Apple device: Safari → `tv.tools.ejfox.com` → AirPlay → your Apple TV (mirror). Works in 10 seconds. Less reliable for always-on because it ties up the source device.
+
+---
+
 ## Caveats
 
 - **Age-gated videos won't play** in an unauthenticated iframe. They get marked dead during enrichment.
